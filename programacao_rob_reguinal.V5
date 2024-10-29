@@ -1,0 +1,471 @@
+
+from spike import PrimeHub, LightMatrix, Button, StatusLight, ForceSensor, MotionSensor, Speaker, ColorSensor, App, DistanceSensor, Motor, MotorPair
+from spike.control import wait_for_seconds, wait_until, Timer
+from math import *
+import time
+from hub import battery
+
+hub = PrimeHub()
+motormov = MotorPair ('A','B')
+motora = Motor('A')
+motorb = Motor('B')
+
+sensorleft = ColorSensor('D')
+sensorright = ColorSensor('F')
+motorequip = MotorPair ('C','E')
+motorf = Motor('E')
+motorc = Motor('C')
+
+timer = Timer()
+timer2 = Timer()
+timerpid = Timer()
+timerStart = Timer()
+
+invert = -1
+virtual_gyro = [0]
+degrees = [0]
+chegadas = [0]
+once_flag = False
+
+def millis(): # Return time in milliseconds
+    return time.time_ns()//1000000
+
+def battery_percentage():
+    if battery.voltage() / 81.0 < 95.0: #Defines a battery comparison parameter
+        print("battery voltage LOW: " + str(battery.voltage()))
+        hub.status_light.on('red')
+        wait_for_seconds(0.1)
+
+    elif battery.voltage() / 81.0 < 98.0:
+        print ("battery voltage GOOD: " + str(battery.voltage()))
+        hub.status_light.on('green')
+        wait_for_seconds(0.1)
+
+    else:
+        print("battery voltage HIGH: " + str(battery.voltage()))
+        hub.status_light.on('yellow')
+        wait_for_seconds(0.1)
+
+def convert_gyro(value):
+    gyro = 0
+    if type(value) == "list":
+        if value[0] > 179:
+            gyro = value[0] - 360
+        elif value[0] < -180:
+            gyro = value[0] + 360
+        else:
+            gyro = value[0]
+    elif type(value) == "int":
+        if value > 179:
+            gyro = value - 360
+        elif value < -180:
+            gyro = value + 360
+        else:
+            gyro = value
+    return gyro
+
+
+def virtual_control(tratado, gabarito):
+    virtual_value = tratado + gabarito
+    return virtual_value
+
+def virtual_mapping(saida, debugg = True):
+    global degrees
+    global once_flag
+    global chegadas
+    last_gyro = 0
+    virtual_giro = 0
+    grau = 0
+    gabaritos = [0, 0, 90, 0, 0, 90]
+    if once_flag:
+        if len(degrees) == 0: 
+            last_gyro = gabaritos[saida - 1]
+        else:
+            last_gyro = last_gyro
+        chegadas = sum(degrees)
+        degrees.clear()
+        once_flag = False
+    else:
+        pass
+    if not debugg:
+        virtual_gyro = virtual_control(convert_gyro(chegadas)*-1, gabaritos[saida]) if len(degrees) != 0 else last_gyro
+        if virtual_gyro != hub.motion_sensor.get_yaw_angle():
+            hub.status_light.on("red") 
+        else:
+            hub.status_light.on("green")
+    else:
+        if gabaritos[saida] != hub.motion_sensor.get_yaw_angle():
+            hub.status_light.on("red")
+        else:
+            hub.status_light.on("green")
+
+def p_control(erro, pot=40, kp=10.0):
+    correction = erro * kp
+    left_speed = pot - correction + 6.8
+    right_speed = pot + correction
+    motormov.start_tank_at_power(int(left_speed),int(right_speed))
+
+def axis_curve(angle, kp=18.0, limit_correction=30, time_limit=0):
+    hub.motion_sensor.reset_yaw_angle()
+    count = 0
+    global degrees
+    timer.reset()
+    while count <= 10:
+        #count of 10 confirmations for curve accuracy
+        erro = hub.motion_sensor.get_yaw_angle() - angle
+        # calculate error from gyroscope sensor
+        count = count + 1 if erro == 0 else 0
+        #counts 1 confirmation when the error reaches 0 (find the desired degree)
+        correction = erro * kp
+        #proportional counting
+        correction = correction if abs(correction) < limit_correction else limit_correction * correction/abs(correction)
+        #defines the correction for the value of the limit_correction parameter if it exceeds this value
+        motormov.start_tank_at_power(int(-correction), int(correction))
+        #start motors for curve (each in the opposite sign of the other), with the correction made in the proportional
+        if time_limit > 0 and timer.now() > time_limit:
+            degrees.append(hub.motion_sensor.get_yaw_angle())
+            break
+        #time limiter for the curve
+        if hub.right_button.is_pressed():
+            motormov.stop()
+            return False
+        #cascade system
+    degrees.append(hub.motion_sensor.get_yaw_angle())
+    motormov.stop()
+    return True
+
+def move_robot(value, move_type='cm', pot=60, kp=20, threading=False, equip_value=0, equip_pot=80, motor='left'):
+    if move_type == 'cm':
+        hub.motion_sensor.reset_yaw_angle()
+        setpoint = hub.motion_sensor.get_yaw_angle()
+        motora.set_degrees_counted(0)
+        target_value = abs(value) * 360 / (3.2 * pi) # 10.4 cm per rotation
+        timer.reset()
+        while abs(motora.get_degrees_counted()) < target_value:
+            p_control(setpoint, pot=pot * value/abs(value), kp=kp)
+            if threading and timer.now() < equip_value:
+                motorc.start_at_power(equip_pot) if motor == 'left' else motorf.start_at_power(equip_pot)
+            else:
+                motorc.stop() if motor == 'left' else motorf.stop()
+            if hub.right_button.is_pressed():
+                motormov.stop()
+                return False
+    else: # move_type='time'
+        hub.motion_sensor.reset_yaw_angle()
+        timer.reset()
+        timer2.reset()
+        while timer.now() < abs(value):
+            p_control(hub.motion_sensor.get_yaw_angle(), pot=pot * value/abs(value), kp=kp)
+            if threading:
+                motorf.set_degrees_counted(0)
+                motorc.set_degrees_counted(0)
+                motorc.run_to_degrees_counted(equip_value, equip_pot) if motor == 'left' else motorf.run_to_degrees_counted(equip_value, equip_pot)
+            else:
+                motorc.stop() if motor == 'left' else motorf.stop()
+            if hub.right_button.is_pressed():
+                motormov.stop()
+                return False
+    motorc.stop() if motor == 'left' else motorf.stop()
+    motormov.stop()
+    return True
+
+
+def move_equip(value, pot=80, motor='right', move_type='rotations'):
+    if motor=='right':
+        motorf.run_for_rotations(value, speed=pot) if move_type == 'rotations' else motorf.run_for_seconds(value, speed=pot)
+    else:
+        motorc.run_for_rotations(value, speed=pot) if move_type == 'rotations' else motorc.run_for_seconds(value, speed=pot)
+    if hub.right_button.is_pressed():
+        motormov.stop()
+        return False
+    return True
+
+
+def follow_to_line(sensor, setpoint=50, kp=1.0, invert_logic=False, pot=40, count=False, count_sensor="right"):
+    timer.reset()
+    timer2.reset()
+    while True:
+        error = sensor.get_reflected_light() - setpoint if invert_logic else setpoint - sensor.get_reflected_light()
+        p = kp * error
+        motormov.start_tank_at_power(int(pot - p), int(pot + p))
+
+        if count:
+            if count_sensor == 'right':
+                if sensorright.get_reflected_light() <= 40:
+                    break
+            else:
+                if sensorleft.get_reflected_light() <= 40:
+                    break
+        if hub.right_button.is_pressed():
+            motormov.stop()
+            return False
+    motormov.stop()
+    return True
+
+
+def line_following(sensor, setpoint=50, kp=1.0, invert_logic=False, pot=40, time_limit=0, error_limit=0, two=False, start_time=3):
+    timer.reset()
+    timer2.reset()
+    firstTime = millis()
+    while sensor.get_color() in ['black', 'white'] or timer.now() < start_time: #timer.now() < start_time:
+        if two == True:
+            error = sensorright.get_reflected_light() - sensorleft.get_reflected_light()
+        else:
+            error = sensor.get_reflected_light() - setpoint if invert_logic else setpoint - sensor.get_reflected_light()
+        p = kp * error
+        motormov.start_tank_at_power(int(pot - p), int(pot + p))
+        if error_limit > 0:
+            if abs(error) > error_limit:
+                hub.light_matrix.show_image('HEART')
+                break
+        if time_limit > 0:
+            if millis() - firstTime >= time_limit * 1000.0:
+                break
+
+        if hub.right_button.is_pressed():
+            motormov.stop()
+            return False
+    motormov.stop()
+    return True
+
+def move_stall(pot=60, dif=3, time_limit=4):
+    timer.reset()
+    motorc.start_at_power(pot)
+    velocidade = 0
+    while True:
+        time.sleep(0.4)
+        velocidade_agora = motorc.get_speed()
+        if abs(velocidade_agora) < abs(velocidade) - dif or timer.now() > time_limit:
+            break
+        velocidade = velocidade_agora
+    hub.speaker.beep(85, 0.1)
+    motorc.stop()
+    return True
+
+def identificacor(cor, pot= 60, kp = 10.0):
+    hub.motion_sensor.reset_yaw_angle()
+    setpoint = hub.motion_sensor.get_yaw_angle()
+    if cor == "black" or "BLACK":
+        while not sensorright.get_color() == 'black':
+            p_control(setpoint, pot=pot, kp=kp)
+            if hub.right_button.is_pressed():
+                motormov.stop()
+                return False
+    elif cor == "white":
+        while not sensorleft.get_color() or sensorright.get_color() == "white":
+            p_control(setpoint(), pot=pot , kp=kp)
+            if hub.right_button.is_pressed():
+                motormov.stop()
+                return False
+    else:
+        while not sensorleft.get_color() or sensorright.get_color() == cor :
+            p_control(setpoint(), pot=pot, kp=kp)
+            if hub.right_button.is_pressed():
+                motormov.stop()
+                return False
+    motormov.stop()
+    return True
+
+############################################################################################
+last_value = -1
+hub.motion_sensor.reset_yaw_angle()
+battery_percentage()
+while not hub.left_button.is_pressed():
+    value = abs(hub.motion_sensor.get_yaw_angle())
+    if value != last_value:
+        hub.light_matrix.write(value if value <= 9 else 9) 
+        last_value = value
+hub.speaker.beep(80, 0.2)# gyroscope check
+
+
+hub.motion_sensor.reset_yaw_angle()
+time.sleep(1)
+main = True
+saida = 1 
+correction_flag = True
+hub.light_matrix.write(saida)
+light_color_names = ['','blue', 'azure', 'white', 'pink', 'red', 'yellow', 'blue', 'cyan', 'red']
+
+
+while main:
+    virtual_mapping(saida) 
+    if hub.right_button.is_pressed():#press the right button to cycle through the programs.
+        saida = saida + 1 if saida < 9 else 1
+        once_flag = True
+        hub.light_matrix.write(saida)
+        correction_flag = True
+        hub.speaker.beep(85, 0.1)
+        time.sleep(0.1)
+
+    #beginning of the program
+
+    if hub.left_button.is_pressed():
+        flag = False
+        first_time = time.time_ns()
+        while hub.left_button.is_pressed():
+            if time.time_ns() - first_time >= 300*(10**6):
+                flag = True
+                break
+        if not flag:
+            saida = saida - 1 if saida > 1 else 9
+            correction_flag = True
+            hub.light_matrix.write(saida)
+            hub.speaker.beep(85, 0.1)
+            time.sleep(0.1)
+        else:
+            if saida == 1:
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('DUCK')
+                #if cascade is for if you click on the right button, allow it to pass the exit
+                if move_equip(invert * -0.1, pot = 40, motor='left'):
+                 if move_robot(-2, pot=70, move_type='time'):
+                  if move_robot(17, pot=25):
+                   if axis_curve(7, kp=50.0, limit_correction= 70,time_limit=1):
+                    if move_robot(10, pot=35):
+                     if move_robot(10, pot=35):
+                      if move_robot(-2, pot=75):
+                       if move_robot(1, pot=75):
+                        if move_robot(-1.3, pot=35):
+                         if move_equip(invert * 2.9, pot = 100, motor='right'):
+                          if move_robot(-0.5, pot=60):
+                           if axis_curve(-2, kp=50.0, limit_correction= 50,time_limit=1):
+                            if move_equip(invert * 0.7, pot = 60, motor='left'):
+                             if move_robot(-9, pot=80):
+                              if axis_curve(17, kp=50.0, limit_correction= 50,time_limit=1):
+                               if move_robot(-17, pot=80):
+                                if axis_curve(90, kp=50.0, limit_correction= 50):
+                                 pass
+                              
+            elif saida == 2:
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('SMILE')
+                # TRIDENTE
+                if move_equip(invert * 0.1, pot = 60, motor='right'):
+                 if move_equip(invert * -0.1, pot = 60, motor='left'):
+                  if move_robot(15, pot=70):
+                   if axis_curve(16, kp=30.0, limit_correction= 70,time_limit=2):
+                    if move_robot(35, pot=50):
+                     if move_equip(invert * -0.6, pot = 60, motor='right'):
+                      if move_equip(invert * 0.6, pot = 60, motor='left'):
+                       if move_robot(-50, pot=100):
+                        pass
+                
+
+            elif saida == 3:#////////////////////////////////////////////////////////////////////////
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('SMILE')
+                #if cascade is for if you click on the right button, allow it to pass the exit
+                if move_equip(invert * -1.5, pot = 60, motor='left'):
+                 if move_robot(44, pot=40):
+                  if axis_curve(-77, kp=30.0, limit_correction= 60,time_limit=2):
+                   if move_robot(12, pot=40):
+                    if axis_curve(37, kp=30.0, limit_correction=60,time_limit=2):
+                     if move_robot(3, pot=40):
+                      if move_equip(invert * 0.5, pot = 10, motor='right'):
+                       if move_equip(invert * 2, pot = 20, motor='left'):
+                        if move_robot(-1, pot=40):
+                         if axis_curve(10, kp=30.0, limit_correction= 60,time_limit=2):
+                          if move_robot(-50, pot=80):               
+                           pass
+                                                       
+            elif saida == 4:
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('SMILE')
+                #Pega polvo
+                if move_robot(15, pot=40):
+                 if axis_curve(14, kp=27.0, limit_correction= 50,time_limit=2):
+                  if move_robot(22.7, pot=40):
+                   if axis_curve(77, kp=27.0, limit_correction= 50, time_limit=3):
+                    if move_robot(15.5 , pot=50):
+                     if axis_curve(4, kp=27.0, limit_correction= 50,time_limit=1):
+                      if axis_curve(-3, kp=27.0, limit_correction= 50,time_limit=1):
+                       if move_robot(-14, pot=35):
+                        if axis_curve(-7, kp=27.0, limit_correction= 50,time_limit=2):
+                         if move_robot(9, pot=40):
+                          if move_robot(-6, pot=40):
+                           if axis_curve(-45, kp=27.0, limit_correction= 50, time_limit=2):
+                            if move_robot(22, pot=40):
+                             if axis_curve(48, kp=27.0, limit_correction= 50,time_limit=2):
+                              if move_robot(1.3, pot=40):
+                               if move_equip(invert * -0.5, pot = 15, motor='left'):
+                                if move_robot(10, pot=40):
+                                 if move_equip(invert * 0.5, pot = 15, motor='left'):
+                                  if axis_curve(-10, kp=27.0, limit_correction= 50,time_limit=2):
+                                   if move_robot(10, pot=40):
+                                    correction_flag = True
+                                    pass
+
+            elif saida == 6:#////////////////////////////////////////////////////////////////////////
+                correction_flag = True
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('DUCK')
+                #BALEIA
+                if move_robot(40.25, pot=70):
+                 if axis_curve(23, kp=30.0, limit_correction= 60,time_limit=2):
+                  if move_equip(invert * 0.7, pot = 100, motor='right'):
+                   if axis_curve(-23, kp=30.0, limit_correction= 60,time_limit=2):
+                    if move_robot(12.5, pot=70):
+                     if axis_curve(43, kp=30.0, limit_correction= 60,time_limit=2):
+                      if move_robot(10, pot=70):
+                       if move_equip(invert * 1, pot = 100, motor='left'):
+                        if move_robot(-10, pot=70):
+                         if axis_curve(-60, kp=30.0, limit_correction= 60,time_limit=2):
+                          if move_robot(-50, pot=70): 
+                           correction_flag = True
+                           pass
+
+            elif saida == 7:#///////////////////////////////////////////////////////////////////////
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('DUCK')
+                if move_robot(37, pot=60):
+                 if move_equip(invert * 0.5, pot = 80, motor='left'):
+                  if move_robot(10, pot = 85):
+                   if move_equip(invert * -5, pot = 100, motor='right'):
+                    correction_flag = True
+                    pass
+
+                
+        
+            elif saida == 5:
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('DUCK')
+                if move_robot(30, pot=70, kp=30.0):
+                 if move_equip(invert * 0.7, pot = 80, motor='right'):
+                  if move_robot(20, pot=70, kp=30.0):
+                   if axis_curve(-17, kp=30.0, limit_correction= 60,time_limit=2):
+                    if identificacor("black", pot=60, kp=30.0):
+                     if move_robot(-15, pot=70, kp=30.0):
+                      if axis_curve(-90, kp=30.0, limit_correction= 60,time_limit=2):
+                       if move_robot(-15, pot=70, kp=30.0):
+                        correction_flag = True
+                        pass
+            
+            elif saida == 8:
+                correction_flag = False
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('DUCK')
+                if move_robot(53, pot=60):
+                 if axis_curve(-89, kp=30.0, limit_correction= 60):
+                  if move_robot(13.5, pot=60):
+                   if move_equip(invert * -0.7, pot = 100, motor='right'):   
+                    if axis_curve(-8, kp=30.0, limit_correction= 60):
+                     if move_robot(45, pot=60):
+                      if move_robot(-25, pot=60):
+                       if axis_curve(60, kp=30.0, limit_correction= 60):
+                        if move_robot(16, pot=60):
+                         correction_flag = True
+                         pass
+
+            elif saida == 9:#/////////////////////////////////////////////////////////////////////
+                hub.status_light.on('green')
+                hub.light_matrix.show_image('SMILE')
+                #break to exit the code
+                break
+            time.sleep(0.5)
+            hub.light_matrix.write(saida)
